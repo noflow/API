@@ -46,4 +46,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install gspread oauth2client py
+          pip install gspread oauth2client python-dotenv requests
+
+      - name: Run Option 1 (Log Matches)
+        run: python scraper_cron.py
