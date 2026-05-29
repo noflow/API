@@ -4,10 +4,15 @@
 
 import os
 import json
+from copy import deepcopy
+import shutil
+import subprocess
 import requests
 import gspread
-from datetime import datetime
+from datetime import datetime, time as datetime_time
 import math
+import time
+from zoneinfo import ZoneInfo
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
 
@@ -16,11 +21,87 @@ from dotenv import load_dotenv
 load_dotenv()
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_FILE = "google_credentials.json"
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
+
+EA_GAME_SLUG = os.getenv("EA_NHL_GAME_SLUG", "nhl-26").strip() or "nhl-26"
+EA_PLATFORM = os.getenv("EA_PLATFORM", "common-gen5").strip() or "common-gen5"
+EA_MATCH_TYPE = os.getenv("EA_MATCH_TYPE", "club_private").strip() or "club_private"
+LAGOUT_MERGE_WINDOW_MINUTES = int(os.getenv("LAGOUT_MERGE_WINDOW_MINUTES", "30"))
+LAGOUT_HOLD_MINUTES = int(os.getenv("LAGOUT_HOLD_MINUTES", "45"))
+LEAGUE_TIMEZONE = os.getenv("LEAGUE_TIMEZONE", "America/Los_Angeles")
+LEAGUE_GAME_DAYS = {
+    day.strip().lower()
+    for day in os.getenv("LEAGUE_GAME_DAYS", "thu,fri,sat,sun").split(",")
+    if day.strip()
+}
+LEAGUE_START_TIME = os.getenv("LEAGUE_START_TIME", "17:45")
+LEAGUE_END_TIME = os.getenv("LEAGUE_END_TIME", "20:30")
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
+if GOOGLE_CREDS_JSON:
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(GOOGLE_CREDS_JSON), scope)
+else:
+    creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
 client = gspread.authorize(creds)
 sheet = client.open_by_key(GOOGLE_SHEET_ID)
+
+ACTIVE_LOG_PREFIX = ""
+SEASON_SETTINGS_SHEET = "Season Settings"
+SEASON_DATE_DEFAULTS = [
+    ("Regular Season Start", "2026-05-28", "First regular-season date to scrape"),
+    ("Regular Season End", "2026-08-02", "Last regular-season date to scrape"),
+    ("Playoffs Start", "2026-08-06", "First playoff date to scrape"),
+    ("Playoffs End", "2026-08-23", "Last playoff date to scrape"),
+]
+
+
+def set_active_log_phase(phase):
+    global ACTIVE_LOG_PREFIX
+    ACTIVE_LOG_PREFIX = "Playoff " if phase == "playoffs" else ""
+
+
+def log_tab_title(base_title):
+    return f"{ACTIVE_LOG_PREFIX}{base_title}"
+
+
+def ensure_season_settings_tab():
+    try:
+        ws = sheet.worksheet(SEASON_SETTINGS_SHEET)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=SEASON_SETTINGS_SHEET, rows="20", cols="3")
+        ws.append_row(["Setting", "Value", "Notes"])
+        ws.append_rows(SEASON_DATE_DEFAULTS, value_input_option="USER_ENTERED")
+        ws.format("1:1", {"textFormat": {"bold": True}})
+        ws.freeze(rows=1)
+        return ws
+
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(["Setting", "Value", "Notes"])
+        existing = set()
+    else:
+        existing = {row[0] for row in values[1:] if row}
+
+    missing = [row for row in SEASON_DATE_DEFAULTS if row[0] not in existing]
+    if missing:
+        ws.append_rows(missing, value_input_option="USER_ENTERED")
+    return ws
+
+
+def get_season_settings():
+    ws = ensure_season_settings_tab()
+    records = ws.get_all_records()
+    settings = {key: value for key, value, _ in SEASON_DATE_DEFAULTS}
+    for row in records:
+        setting = str(row.get("Setting", "")).strip()
+        value = str(row.get("Value", "")).strip()
+        if setting and value:
+            settings[setting] = value
+    return settings
+
+
+def parse_setting_date(settings, key):
+    return datetime.strptime(settings[key], "%Y-%m-%d").date()
 
 # ── COLUMN MAPPING UTILS ──
 
@@ -67,7 +148,7 @@ def get_team_list():
 
 def get_existing_game_match_ids():
     try:
-        ws = sheet.worksheet("Game Log")
+        ws = sheet.worksheet(log_tab_title("Game Log"))
         data = ws.get_all_values()[1:]
         return set(r[0] for r in data)
     except gspread.exceptions.WorksheetNotFound:
@@ -118,6 +199,341 @@ def detect_lagout(match):
     return "no"
 
 
+def safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_hhmm(value):
+    hour, minute = value.split(":", 1)
+    return datetime_time(int(hour), int(minute))
+
+
+def is_league_window_match(match):
+    timestamp = safe_int(match.get("timestamp", 0))
+    if timestamp <= 0:
+        return False
+
+    local_dt = datetime.fromtimestamp(timestamp, ZoneInfo(LEAGUE_TIMEZONE))
+    day_key = local_dt.strftime("%a").lower()[:3]
+    if day_key not in LEAGUE_GAME_DAYS:
+        return False
+
+    start_time = parse_hhmm(LEAGUE_START_TIME)
+    end_time = parse_hhmm(LEAGUE_END_TIME)
+    return start_time <= local_dt.time() <= end_time
+
+
+def filter_matches_to_league_window(all_matches):
+    filtered = [match for match in all_matches if is_league_window_match(match)]
+    skipped = len(all_matches) - len(filtered)
+    if skipped:
+        print(
+            f"Skipped {skipped} matches outside league window "
+            f"({','.join(sorted(LEAGUE_GAME_DAYS))} {LEAGUE_START_TIME}-{LEAGUE_END_TIME} {LEAGUE_TIMEZONE})."
+        )
+    return filtered
+
+
+def get_match_season_phase(match, settings):
+    timestamp = safe_int(match.get("timestamp", 0))
+    if timestamp <= 0:
+        return None
+
+    local_date = datetime.fromtimestamp(timestamp, ZoneInfo(LEAGUE_TIMEZONE)).date()
+    regular_start = parse_setting_date(settings, "Regular Season Start")
+    regular_end = parse_setting_date(settings, "Regular Season End")
+    playoffs_start = parse_setting_date(settings, "Playoffs Start")
+    playoffs_end = parse_setting_date(settings, "Playoffs End")
+
+    if regular_start <= local_date <= regular_end:
+        return "regular"
+    if playoffs_start <= local_date <= playoffs_end:
+        return "playoffs"
+    return None
+
+
+def split_matches_by_season_phase(all_matches):
+    settings = get_season_settings()
+    grouped = {"regular": [], "playoffs": []}
+    skipped = []
+
+    for match in all_matches:
+        phase = get_match_season_phase(match, settings)
+        if phase in grouped:
+            grouped[phase].append(match)
+        else:
+            skipped.append(str(match.get("matchId", "")))
+
+    if skipped:
+        print(f"Skipped {len(skipped)} matches outside configured season/playoff date ranges.")
+    return grouped
+
+
+def club_score(club_data):
+    return safe_int(club_data.get("score", club_data.get("goals", 0)))
+
+
+def player_goal_total(match, club_id):
+    return sum(
+        safe_int(player.get("skgoals", 0))
+        for player in match.get("players", {}).get(str(club_id), {}).values()
+    )
+
+
+def match_piece_score(match, club_id):
+    if is_dnf_match(match):
+        return player_goal_total(match, club_id)
+    return club_score(match.get("clubs", {}).get(str(club_id), {}))
+
+
+def is_dnf_match(match):
+    for club_data in match.get("clubs", {}).values():
+        if str(club_data.get("winnerByDnf", "0")) == "1":
+            return True
+        if safe_int(club_data.get("result", 0)) & 16384:
+            return True
+    return False
+
+
+def is_mercy_rule_match(match, mercy_goal_diff=8):
+    clubs = match.get("clubs", {})
+    for club_data in clubs.values():
+        goals = club_score(club_data)
+        opp = safe_int(club_data.get("opponentScore", 0))
+        if abs(goals - opp) >= mercy_goal_diff:
+            return True
+    return False
+
+
+def lagout_merge_key(match):
+    clubs = match.get("clubs", {})
+    if len(clubs) != 2:
+        return None
+    return tuple(sorted(str(cid) for cid in clubs.keys()))
+
+
+def should_hold_recent_lagout(match):
+    timestamp = safe_int(match.get("timestamp", 0))
+    if timestamp <= 0:
+        return False
+    return (time.time() - timestamp) < (LAGOUT_HOLD_MINUTES * 60)
+
+
+def is_mergeable_lagout_piece(match):
+    return is_dnf_match(match) and not is_mercy_rule_match(match)
+
+
+def weighted_rating(values):
+    total_weight = sum(weight for _, weight in values)
+    if total_weight > 0:
+        return sum(value * weight for value, weight in values) / total_weight
+    return sum(value for value, _ in values) / len(values) if values else 0.0
+
+
+def merge_player_rows(rows):
+    merged = deepcopy(rows[-1])
+    sum_keys = set()
+    for row in rows:
+        for key in row.keys():
+            if key.startswith("sk") or key.startswith("gl") or key in ("toiseconds", "toi"):
+                if "pct" not in key.lower() and key not in ("glsavepct",):
+                    sum_keys.add(key)
+
+    for key in sum_keys:
+        merged[key] = str(sum(safe_int(row.get(key, 0)) for row in rows))
+
+    total_seconds = sum(safe_int(row.get("toiseconds", 0)) for row in rows)
+    if total_seconds:
+        merged["toiseconds"] = str(total_seconds)
+        merged["toi"] = str(max(1, round(total_seconds / 60)))
+
+    for key in ("ratingOffense", "ratingDefense", "ratingTeamplay"):
+        rating_values = [
+            (safe_float(row.get(key, 0)), safe_int(row.get("toiseconds", row.get("toi", 0))))
+            for row in rows
+        ]
+        merged[key] = str(round(weighted_rating(rating_values)))
+
+    saves = safe_int(merged.get("glsaves", 0))
+    ga = safe_int(merged.get("glga", 0))
+    shots_against = saves + ga
+    if shots_against:
+        merged["glsavepct"] = f"{saves / shots_against:.2f}"
+
+    return merged
+
+
+def merge_lagout_chain(matches):
+    chain = sorted(matches, key=lambda m: safe_int(m.get("timestamp", 0)))
+    merged = deepcopy(chain[0])
+    merged["matchId"] = "+".join(str(m.get("matchId", "")) for m in chain)
+    merged["timestamp"] = chain[0].get("timestamp", 0)
+    merged["timeAgo"] = chain[-1].get("timeAgo", chain[0].get("timeAgo", {}))
+    merged["lagoutMerged"] = True
+    merged["componentMatchIds"] = [str(m.get("matchId", "")) for m in chain]
+
+    club_ids = list(chain[0].get("clubs", {}).keys())
+    club_totals = {cid: 0 for cid in club_ids}
+    for match in chain:
+        for cid in club_ids:
+            club_totals[cid] += match_piece_score(match, cid)
+
+    for cid in club_ids:
+        source_club = next(
+            (m.get("clubs", {}).get(cid, {}) for m in reversed(chain) if cid in m.get("clubs", {})),
+            {},
+        )
+        club = deepcopy(source_club)
+        opponent_id = next(other for other in club_ids if other != cid)
+        club["goals"] = str(club_totals[cid])
+        club["score"] = str(club_totals[cid])
+        club["opponentScore"] = str(club_totals[opponent_id])
+        club["winnerByDnf"] = "0"
+        if club_totals[cid] > club_totals[opponent_id]:
+            club["result"] = "1"
+        elif club_totals[cid] < club_totals[opponent_id]:
+            club["result"] = "2"
+        else:
+            club["result"] = "0"
+
+        for key in ("ppg", "ppo", "shots", "toa", "passa", "passc", "pim", "shg"):
+            club[key] = str(sum(safe_int(m.get("clubs", {}).get(cid, {}).get(key, 0)) for m in chain))
+
+        merged["clubs"][cid] = club
+
+    merged_players = {}
+    for cid in club_ids:
+        player_groups = {}
+        for match in chain:
+            for pid, player in match.get("players", {}).get(cid, {}).items():
+                player_groups.setdefault(pid, []).append(player)
+        merged_players[cid] = {
+            pid: merge_player_rows(rows)
+            for pid, rows in player_groups.items()
+        }
+    merged["players"] = merged_players
+    return merged
+
+
+def combine_lagout_matches(all_matches):
+    """
+    Combine back-to-back non-mercy DNF games between the same clubs.
+    Recent unpaired lagouts are held back so the reload game can arrive on the next run.
+    """
+    sorted_matches = sorted(all_matches, key=lambda m: safe_int(m.get("timestamp", 0)))
+    used = set()
+    combined = []
+    window_seconds = LAGOUT_MERGE_WINDOW_MINUTES * 60
+
+    for i, match in enumerate(sorted_matches):
+        match_id = str(match.get("matchId", ""))
+        if match_id in used:
+            continue
+
+        key = lagout_merge_key(match)
+        if not key or not is_mergeable_lagout_piece(match):
+            combined.append(match)
+            used.add(match_id)
+            continue
+
+        match_time = safe_int(match.get("timestamp", 0))
+        merge_chain = [match]
+        latest_chain_time = match_time
+        for candidate in sorted_matches[i + 1:]:
+            candidate_id = str(candidate.get("matchId", ""))
+            if candidate_id in used:
+                continue
+            candidate_time = safe_int(candidate.get("timestamp", 0))
+            if candidate_time - latest_chain_time > window_seconds:
+                break
+            if lagout_merge_key(candidate) == key and is_mergeable_lagout_piece(candidate):
+                merge_chain.append(candidate)
+                latest_chain_time = candidate_time
+
+        if len(merge_chain) > 1:
+            chain_ids = [str(piece.get("matchId", "")) for piece in merge_chain]
+            merged = merge_lagout_chain(merge_chain)
+            combined.append(merged)
+            used.update(chain_ids)
+            print(f"Merged lagout continuation {' + '.join(chain_ids)} into {merged['matchId']}")
+        elif should_hold_recent_lagout(match):
+            used.add(match_id)
+            print(f"Holding recent lagout {match_id}; waiting for a possible continuation game.")
+        else:
+            combined.append(match)
+            used.add(match_id)
+
+    return sorted(combined, key=lambda m: safe_int(m.get("timestamp", 0)), reverse=True)
+
+
+def fetch_private_matches_with_node(club_id, referer):
+    node_bin = os.getenv("NODE_BINARY") or shutil.which("node")
+    if not node_bin:
+        print(f"Node fetch fallback unavailable for club {club_id}; node was not found.")
+        return []
+
+    payload = {
+        "clubId": str(club_id),
+        "matchType": EA_MATCH_TYPE,
+        "platform": EA_PLATFORM,
+        "referer": referer,
+    }
+    script = """
+const payload = JSON.parse(process.argv[1]);
+const url = new URL('https://proclubs.ea.com/api/nhl/clubs/matches');
+url.search = new URLSearchParams({
+  matchType: payload.matchType,
+  platform: payload.platform,
+  clubIds: payload.clubId
+});
+const res = await fetch(url, {
+  headers: {
+    'User-Agent': 'Mozilla/5.0',
+    'Accept': 'application/json',
+    'Referer': payload.referer
+  }
+});
+const text = await res.text();
+if (!res.ok) {
+  console.error(`${res.status} ${text.slice(0, 300)}`);
+  process.exit(1);
+}
+process.stdout.write(text);
+"""
+    try:
+        completed = subprocess.run(
+            [node_bin, "--input-type=module", "-e", script, json.dumps(payload)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=False,
+        )
+    except Exception as e:
+        print(f"Node fetch fallback failed for club {club_id}: {e}")
+        return []
+
+    if completed.returncode != 0:
+        print(f"Node fetch fallback returned an error for club {club_id}: {completed.stderr.strip()}")
+        return []
+
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as e:
+        print(f"Node fetch fallback returned invalid JSON for club {club_id}: {e}")
+        return []
+
+
 
 
 def get_private_matches(club_id):
@@ -125,27 +541,35 @@ def get_private_matches(club_id):
     Hits the EA Pro Clubs API to fetch that club's private matches.
     Returns a list of match JSON objects (or empty list on error).
     """
-    url = (
-        f"https://proclubs.ea.com/api/nhl/clubs/matches"
-        f"?matchType=club_private&platform=common-gen5&clubIds={club_id}"
-    )
+    params = {
+        "matchType": EA_MATCH_TYPE,
+        "platform": EA_PLATFORM,
+        "clubIds": club_id,
+    }
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json",
         "Referer": (
-            f"https://www.ea.com/games/nhl/nhl-25/pro-clubs/match-history?"
-            f"clubId={club_id}&platform=common-gen5"
+            f"https://www.ea.com/games/nhl/{EA_GAME_SLUG}/pro-clubs/match-history?"
+            f"clubId={club_id}&platform={EA_PLATFORM}"
         )
     }
     try:
-        res = requests.get(url, headers=headers, timeout=15)
+        res = requests.get(
+            "https://proclubs.ea.com/api/nhl/clubs/matches",
+            params=params,
+            headers=headers,
+            timeout=15,
+        )
         if res.status_code != 200:
             print(f"❌ EA API returned {res.status_code} for club {club_id}")
+            if res.status_code == 403:
+                return fetch_private_matches_with_node(club_id, headers["Referer"])
             return []
         return res.json()
     except Exception as e:
         print(f"❌ Exception fetching matches for club {club_id}:", e)
-        return []
+        return fetch_private_matches_with_node(club_id, headers["Referer"])
 
 # ── DEBUG: DUMP RAW JSON FOR A SPECIFIC MATCH (CALL MANUALLY IF NEEDED) ──
 
@@ -188,12 +612,12 @@ def create_or_fetch_game_log():
         "Team 1 Result", "Team 2 Result", "OT", "Ended Early", "Pushed Timestamp"
     ]
     try:
-        ws = sheet.worksheet("Game Log")
+        ws = sheet.worksheet(log_tab_title("Game Log"))
         if not ws.get_all_values():
             ws.append_row(headers)
         return ws
     except gspread.exceptions.WorksheetNotFound:
-        ws = sheet.add_worksheet(title="Game Log", rows="1000", cols="40")
+        ws = sheet.add_worksheet(title=log_tab_title("Game Log"), rows="1000", cols="40")
         ws.append_row(headers)
         ws.format("1:1", {"textFormat": {"bold": True}})
         ws.freeze(rows=1)
@@ -231,9 +655,9 @@ def parse_game_row(match, valid_ids):
 
     # ── EXTRACT SCORES AND RESULT CODES ──
     try:
-        s1 = int(t1_raw.get("score", 0))
+        s1 = club_score(t1_raw)
         o1 = int(t1_raw.get("opponentScore", 0))
-        s2 = int(t2_raw.get("score", 0))
+        s2 = club_score(t2_raw)
         o2 = int(t2_raw.get("opponentScore", 0))
     except:
         s1 = o1 = s2 = o2 = 0
@@ -285,15 +709,15 @@ def parse_game_row(match, valid_ids):
         d = club_data.get("details", {})
         name = d.get("name", "Unknown")
         cid_str = str(d.get("clubId", "Unknown"))
-        score_str = club_data.get("score", "0")
+        score_str = str(club_score(club_data))
         ppg_str = club_data.get("ppg", "0")
         ppo_str = club_data.get("ppo", "0")
         try:
-            s = int(club_data.get("score", 0))
+            s = club_score(club_data)
             o = int(club_data.get("opponentScore", 0))
         except:
             s = o = 0
-        result_text = "Win" if s > o else "Loss"
+        result_text = "Win" if s > o else "Loss" if s < o else "Tie"
         return {
             "name": name,
             "id": cid_str,
@@ -305,11 +729,12 @@ def parse_game_row(match, valid_ids):
 
     team1 = extract(t1_raw)
     team2 = extract(t2_raw)
+    lagout_flag = "yes" if match.get("lagoutMerged") else detect_lagout(match)
 
     return [
         match_id,
         readable_date,
-        detect_lagout(match),          # Lagout detected via TOI and mercy rule
+        lagout_flag,                   # Lagout detected via TOI or stitched continuation
         team1["name"],
         team1["id"],
         team1["score"],
@@ -348,7 +773,7 @@ def log_game_data(all_matches, valid_ids):
     if rows_to_append:
         worksheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
         for r in rows_to_append:
-            print(f"📘 Logged match {r[0]} to Game Log")
+            print(f"📘 Logged match {r[0]} to {log_tab_title('Game Log')}")
 
 # ── SKATER LOG ──
 
@@ -358,7 +783,7 @@ def get_existing_skater_match_ids():
     (so we can skip duplicates).
     """
     try:
-        worksheet = sheet.worksheet("Skater Log")
+        worksheet = sheet.worksheet(log_tab_title("Skater Log"))
         data = worksheet.get_all_values()[1:]
         return set(r[0] for r in data)
     except gspread.exceptions.WorksheetNotFound:
@@ -369,9 +794,9 @@ def ensure_skater_log_exists(headers):
     Returns the 'Skater Log' worksheet. If missing, creates it with the provided headers.
     """
     try:
-        return sheet.worksheet("Skater Log")
+        return sheet.worksheet(log_tab_title("Skater Log"))
     except gspread.exceptions.WorksheetNotFound:
-        ws = sheet.add_worksheet(title="Skater Log", rows="5000", cols="50")
+        ws = sheet.add_worksheet(title=log_tab_title("Skater Log"), rows="5000", cols="50")
         ws.append_row(headers)
         # ← make header bold and freeze it
         ws.format("1:1", {"textFormat": {"bold": True}})
@@ -417,7 +842,9 @@ def log_skater_data(all_matches, valid_ids):
 
             club_info = clubs.get(club_key, {})
             try:
-                club_result = "Win" if int(club_info.get("score", 0)) > int(club_info.get("opponentScore", 0)) else "Loss"
+                club_goals = club_score(club_info)
+                club_opp_goals = safe_int(club_info.get("opponentScore", 0))
+                club_result = "Win" if club_goals > club_opp_goals else "Loss" if club_goals < club_opp_goals else "Tie"
             except:
                 club_result = "Loss"
             team_name = club_info.get("details", {}).get("name", "")
@@ -435,6 +862,12 @@ def log_skater_data(all_matches, valid_ids):
                 def pct(num, denom):
                     try:
                         return round((num / (num + denom)) * 100, 2) if (num + denom) > 0 else 0
+                    except:
+                        return 0
+
+                def pct_of_total(num, denom):
+                    try:
+                        return round((num / denom) * 100, 2) if denom > 0 else 0
                     except:
                         return 0
 
@@ -475,7 +908,7 @@ def log_skater_data(all_matches, valid_ids):
                     g("skinterceptions"),
                     g("skpassattempts"),
                     g("skpasses"),
-                    pct(g("skpasses"), g("skpassattempts")),
+                    pct_of_total(g("skpasses"), g("skpassattempts")),
                     g("skpenaltiesdrawn"),
                     g("skpim"),
                     g("skpkclearzone"),
@@ -486,8 +919,8 @@ def log_skater_data(all_matches, valid_ids):
                     g("skshg"),
                     es_goals,
                     shot_attempts,
-                    pct(g("skshots"), shot_attempts),
-                    pct(goals, shots),
+                    pct_of_total(g("skshots"), shot_attempts),
+                    pct_of_total(goals, shots),
                     toi_mins,
                     club_result
                 ]
@@ -507,7 +940,7 @@ def log_skater_data(all_matches, valid_ids):
 
 def get_existing_goalie_match_ids():
     try:
-        worksheet = sheet.worksheet("Goalie Log")
+        worksheet = sheet.worksheet(log_tab_title("Goalie Log"))
         data = worksheet.get_all_values()[1:]
         return set(r[0] for r in data)
     except gspread.exceptions.WorksheetNotFound:
@@ -515,9 +948,9 @@ def get_existing_goalie_match_ids():
 
 def ensure_goalie_log_exists(headers):
     try:
-        return sheet.worksheet("Goalie Log")
+        return sheet.worksheet(log_tab_title("Goalie Log"))
     except gspread.exceptions.WorksheetNotFound:
-        ws = sheet.add_worksheet(title="Goalie Log", rows="5000", cols="30")
+        ws = sheet.add_worksheet(title=log_tab_title("Goalie Log"), rows="5000", cols="30")
         ws.append_row(headers)
         ws.format("1:1", {"textFormat": {"bold": True}})
         ws.freeze(rows=1)
@@ -559,7 +992,9 @@ def log_goalie_data(all_matches, valid_ids):
 
             club_info = clubs.get(club_key, {})
             try:
-                club_result = "Win" if int(club_info.get("score", 0)) > int(club_info.get("opponentScore", 0)) else "Loss"
+                club_goals = club_score(club_info)
+                club_opp_goals = safe_int(club_info.get("opponentScore", 0))
+                club_result = "Win" if club_goals > club_opp_goals else "Loss" if club_goals < club_opp_goals else "Tie"
             except:
                 club_result = "Loss"
             team_name = club_info.get("details", {}).get("name", "")
@@ -580,6 +1015,12 @@ def log_goalie_data(all_matches, valid_ids):
                     except:
                         return 0
 
+                def pct_of_total(num, denom):
+                    try:
+                        return round((num / denom) * 100, 2) if denom > 0 else 0
+                    except:
+                        return 0
+
                 saves = g("glsaves")
                 ga = g("glga")
                 shots_against = saves + ga
@@ -596,7 +1037,7 @@ def log_goalie_data(all_matches, valid_ids):
                     ga,  # store raw GA; actual GAA recalculated when aggregating
                     saves,
                     shots_against,
-                    pct(saves, shots_against),
+                    pct_of_total(saves, shots_against),
                     g("glbrksaves"),
                     pct(g("glbrksaves"), g("glbrkshots")),
                     g("glpensaves"),
@@ -1401,7 +1842,7 @@ def log_game_data(all_matches, valid_ids):
     if rows_to_append:
         worksheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
         for r in rows_to_append:
-            print(f"📘 Logged match {r[0]} to Game Log")
+            print(f"📘 Logged match {r[0]} to {log_tab_title('Game Log')}")
 # ===== END OVERRIDE =====
 
 # ===== OVERRIDE aggregate_stats_to_master_tabs TO PRESERVE EXISTING TOTALS =====
@@ -1722,13 +2163,22 @@ if __name__ == "__main__":
             if mid and mid not in unique_matches:
                 unique_matches[mid] = m
         all_matches_deduped = list(unique_matches.values())
+        all_matches_deduped = combine_lagout_matches(all_matches_deduped)
+        all_matches_deduped = filter_matches_to_league_window(all_matches_deduped)
+        matches_by_phase = split_matches_by_season_phase(all_matches_deduped)
 
-        if not all_matches_deduped:
+        if not any(matches_by_phase.values()):
             print("⚠️ No new matches found.")
         else:
-            log_game_data(all_matches_deduped, valid_ids)
-            log_skater_data(all_matches_deduped, valid_ids)
-            log_goalie_data(all_matches_deduped, valid_ids)
+            for phase in ("regular", "playoffs"):
+                phase_matches = matches_by_phase[phase]
+                if not phase_matches:
+                    continue
+                set_active_log_phase(phase)
+                log_game_data(phase_matches, valid_ids)
+                log_skater_data(phase_matches, valid_ids)
+                log_goalie_data(phase_matches, valid_ids)
+            set_active_log_phase("regular")
             print("✅ Logs updated.")
 
     elif mode == "2":
