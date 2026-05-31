@@ -3,6 +3,7 @@
 
 
 import os
+import sys
 import json
 from copy import deepcopy
 import shutil
@@ -16,10 +17,20 @@ from zoneinfo import ZoneInfo
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+
+
+def progress(message):
+    print(message, flush=True)
+
 # ── LOAD ENV & SETUP GOOGLE SHEETS ──
 
-load_dotenv()
+load_dotenv(override=True)
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+SCHEDULE_SHEET_ID = os.getenv("SCHEDULE_SHEET_ID", "").strip()
 GOOGLE_CREDENTIALS_FILE = "google_credentials.json"
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 
@@ -47,12 +58,18 @@ sheet = client.open_by_key(GOOGLE_SHEET_ID)
 
 ACTIVE_LOG_PREFIX = ""
 SEASON_SETTINGS_SHEET = "Season Settings"
+SCHEDULE_MATCH_KEYS = None
+TEAM_ABBR_BY_CLUB_ID = None
 SEASON_DATE_DEFAULTS = [
     ("Regular Season Start", "2026-05-28", "First regular-season date to scrape"),
     ("Regular Season End", "2026-08-02", "Last regular-season date to scrape"),
     ("Playoffs Start", "2026-08-06", "First playoff date to scrape"),
     ("Playoffs End", "2026-08-23", "Last playoff date to scrape"),
 ]
+
+
+def default_season_settings():
+    return {key: value for key, value, _ in SEASON_DATE_DEFAULTS}
 
 
 def set_active_log_phase(phase):
@@ -68,30 +85,53 @@ def ensure_season_settings_tab():
     try:
         ws = sheet.worksheet(SEASON_SETTINGS_SHEET)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=SEASON_SETTINGS_SHEET, rows="20", cols="3")
-        ws.append_row(["Setting", "Value", "Notes"])
-        ws.append_rows(SEASON_DATE_DEFAULTS, value_input_option="USER_ENTERED")
-        ws.format("1:1", {"textFormat": {"bold": True}})
-        ws.freeze(rows=1)
-        return ws
+        try:
+            ws = sheet.add_worksheet(title=SEASON_SETTINGS_SHEET, rows="20", cols="3")
+            ws.append_row(["Setting", "Value", "Notes"])
+            ws.append_rows(SEASON_DATE_DEFAULTS, value_input_option="USER_ENTERED")
+            ws.format("1:1", {"textFormat": {"bold": True}})
+            ws.freeze(rows=1)
+            return ws
+        except gspread.exceptions.APIError as e:
+            print(f"Could not create '{SEASON_SETTINGS_SHEET}' tab: {e}")
+            print("Using built-in season dates for this run.")
+            return None
 
     values = ws.get_all_values()
     if not values:
-        ws.append_row(["Setting", "Value", "Notes"])
+        try:
+            ws.append_row(["Setting", "Value", "Notes"])
+        except gspread.exceptions.APIError as e:
+            print(f"Could not initialize '{SEASON_SETTINGS_SHEET}' tab: {e}")
+            print("Using built-in season dates for this run.")
+            return None
         existing = set()
     else:
         existing = {row[0] for row in values[1:] if row}
 
     missing = [row for row in SEASON_DATE_DEFAULTS if row[0] not in existing]
     if missing:
-        ws.append_rows(missing, value_input_option="USER_ENTERED")
+        try:
+            ws.append_rows(missing, value_input_option="USER_ENTERED")
+        except gspread.exceptions.APIError as e:
+            print(f"Could not update '{SEASON_SETTINGS_SHEET}' tab: {e}")
+            print("Using the season settings already present in the sheet.")
     return ws
 
 
 def get_season_settings():
+    settings = default_season_settings()
     ws = ensure_season_settings_tab()
-    records = ws.get_all_records()
-    settings = {key: value for key, value, _ in SEASON_DATE_DEFAULTS}
+    if ws is None:
+        return settings
+
+    try:
+        records = ws.get_all_records()
+    except gspread.exceptions.APIError as e:
+        print(f"Could not read '{SEASON_SETTINGS_SHEET}' tab: {e}")
+        print("Using built-in season dates for this run.")
+        return settings
+
     for row in records:
         setting = str(row.get("Setting", "")).strip()
         value = str(row.get("Value", "")).strip()
@@ -145,16 +185,107 @@ def get_team_list():
         return set()
 
 
+def row_index(header):
+    return {str(name).strip(): i for i, name in enumerate(header)}
+
+
+def row_cell(row, idx, name):
+    pos = idx.get(name)
+    if pos is None or pos >= len(row):
+        return ""
+    return str(row[pos]).strip()
+
+
+def normalize_schedule_team_name(value):
+    text = " ".join(str(value or "").lower().replace("-", " ").split())
+    for prefix in ("cwnhl ", "cwhl ", "wca "):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    aliases = {
+        "columbus": "columbus blue jackets",
+        "golden knights": "vegas golden knights",
+        "vegas knights": "vegas golden knights",
+        "los angeles kings": "la kings",
+    }
+    return aliases.get(text, text)
+
+
+def get_team_abbr_by_club_id():
+    global TEAM_ABBR_BY_CLUB_ID
+    if TEAM_ABBR_BY_CLUB_ID is not None:
+        return TEAM_ABBR_BY_CLUB_ID
+
+    TEAM_ABBR_BY_CLUB_ID = {}
+    try:
+        rows = sheet.worksheet("Team List").get_all_values()
+        if not rows:
+            return TEAM_ABBR_BY_CLUB_ID
+        idx = row_index(rows[0])
+        for row in rows[1:]:
+            club_id = row_cell(row, idx, "Club ID")
+            abbr = row_cell(row, idx, "Abbreviation").upper()
+            if club_id and abbr:
+                TEAM_ABBR_BY_CLUB_ID[club_id] = abbr
+    except Exception as e:
+        print("Could not read team abbreviations for schedule matching:", e)
+    return TEAM_ABBR_BY_CLUB_ID
+
+
+def load_schedule_match_keys():
+    global SCHEDULE_MATCH_KEYS
+    if SCHEDULE_MATCH_KEYS is not None:
+        return SCHEDULE_MATCH_KEYS
+
+    SCHEDULE_MATCH_KEYS = set()
+    if not SCHEDULE_SHEET_ID:
+        return SCHEDULE_MATCH_KEYS
+
+    try:
+        schedule_book = client.open_by_key(SCHEDULE_SHEET_ID)
+        team_rows = schedule_book.worksheet("Teams").get_all_values()
+        if not team_rows:
+            return SCHEDULE_MATCH_KEYS
+
+        team_idx = row_index(team_rows[0])
+        name_to_abbr = {}
+        for row in team_rows[1:]:
+            name = row_cell(row, team_idx, "Team Name")
+            abbr = row_cell(row, team_idx, "Abbreviation").upper()
+            if name and abbr:
+                name_to_abbr[normalize_schedule_team_name(name)] = abbr
+
+        for tab_name in ("Regular Season Schedule", "Playoff Schedule"):
+            try:
+                schedule_rows = schedule_book.worksheet(tab_name).get_all_values()
+            except gspread.exceptions.WorksheetNotFound:
+                continue
+            if not schedule_rows:
+                continue
+            sched_idx = row_index(schedule_rows[0])
+            for row in schedule_rows[1:]:
+                date = row_cell(row, sched_idx, "Date")
+                away = row_cell(row, sched_idx, "Away")
+                home = row_cell(row, sched_idx, "Home")
+                away_abbr = name_to_abbr.get(normalize_schedule_team_name(away))
+                home_abbr = name_to_abbr.get(normalize_schedule_team_name(home))
+                if date and away_abbr and home_abbr:
+                    SCHEDULE_MATCH_KEYS.add((date, tuple(sorted([away_abbr, home_abbr]))))
+    except Exception as e:
+        print(f"Could not load schedule match keys; late-game schedule exception disabled: {e}")
+
+    return SCHEDULE_MATCH_KEYS
+
+
 
 def get_existing_game_match_ids():
     try:
         ws = sheet.worksheet(log_tab_title("Game Log"))
         data = ws.get_all_values()[1:]
-        return set(r[0] for r in data)
+        return {normalize_match_id(r[0]) for r in data if r}
     except gspread.exceptions.WorksheetNotFound:
         return set()
 
-# ── EA API FETCH ──
+# ── EA MATCH HISTORY FETCH ──
 
 
 def detect_lagout(match):
@@ -206,6 +337,11 @@ def safe_int(value, default=0):
         return default
 
 
+def normalize_match_id(match_id):
+    normalized = str(match_id or "").strip().replace("+", "-")
+    return normalized.split("-", 1)[0]
+
+
 def safe_float(value, default=0.0):
     try:
         return float(value)
@@ -233,9 +369,50 @@ def is_league_window_match(match):
     return start_time <= local_dt.time() <= end_time
 
 
+def is_late_scheduled_match(match):
+    timestamp = safe_int(match.get("timestamp", 0))
+    if timestamp <= 0:
+        return False
+
+    local_dt = datetime.fromtimestamp(timestamp, ZoneInfo(LEAGUE_TIMEZONE))
+    day_key = local_dt.strftime("%a").lower()[:3]
+    if day_key not in LEAGUE_GAME_DAYS:
+        return False
+
+    end_time = parse_hhmm(LEAGUE_END_TIME)
+    if local_dt.time() <= end_time:
+        return False
+
+    abbr_by_club = get_team_abbr_by_club_id()
+    club_abbrs = []
+    for club_id in match.get("clubs", {}).keys():
+        abbr = abbr_by_club.get(str(club_id))
+        if abbr:
+            club_abbrs.append(abbr)
+
+    if len(club_abbrs) != 2:
+        return False
+
+    schedule_key = (local_dt.date().isoformat(), tuple(sorted(club_abbrs)))
+    return schedule_key in load_schedule_match_keys()
+
+
 def filter_matches_to_league_window(all_matches):
-    filtered = [match for match in all_matches if is_league_window_match(match)]
-    skipped = len(all_matches) - len(filtered)
+    filtered = []
+    skipped = 0
+    late_schedule_kept = 0
+
+    for match in all_matches:
+        if is_league_window_match(match):
+            filtered.append(match)
+        elif is_late_scheduled_match(match):
+            filtered.append(match)
+            late_schedule_kept += 1
+        else:
+            skipped += 1
+
+    if late_schedule_kept:
+        print(f"Included {late_schedule_kept} late game(s) because they matched the schedule.")
     if skipped:
         print(
             f"Skipped {skipped} matches outside league window "
@@ -292,7 +469,7 @@ def player_goal_total(match, club_id):
 
 def match_piece_score(match, club_id):
     if is_dnf_match(match):
-        return player_goal_total(match, club_id)
+        return max(player_goal_total(match, club_id), club_score(match.get("clubs", {}).get(str(club_id), {})))
     return club_score(match.get("clubs", {}).get(str(club_id), {}))
 
 
@@ -376,7 +553,7 @@ def merge_player_rows(rows):
 def merge_lagout_chain(matches):
     chain = sorted(matches, key=lambda m: safe_int(m.get("timestamp", 0)))
     merged = deepcopy(chain[0])
-    merged["matchId"] = "+".join(str(m.get("matchId", "")) for m in chain)
+    merged["matchId"] = str(chain[0].get("matchId", ""))
     merged["timestamp"] = chain[0].get("timestamp", 0)
     merged["timeAgo"] = chain[-1].get("timeAgo", chain[0].get("timeAgo", {}))
     merged["lagoutMerged"] = True
@@ -465,7 +642,7 @@ def combine_lagout_matches(all_matches):
             merged = merge_lagout_chain(merge_chain)
             combined.append(merged)
             used.update(chain_ids)
-            print(f"Merged lagout continuation {' + '.join(chain_ids)} into {merged['matchId']}")
+            print(f"Merged lagout continuation {' - '.join(chain_ids)} into {merged['matchId']}")
         elif should_hold_recent_lagout(match):
             used.add(match_id)
             print(f"Holding recent lagout {match_id}; waiting for a possible continuation game.")
@@ -479,7 +656,7 @@ def combine_lagout_matches(all_matches):
 def fetch_private_matches_with_node(club_id, referer):
     node_bin = os.getenv("NODE_BINARY") or shutil.which("node")
     if not node_bin:
-        print(f"Node fetch fallback unavailable for club {club_id}; node was not found.")
+        print(f"Node fetch unavailable for club {club_id}; node was not found.")
         return []
 
     payload = {
@@ -511,6 +688,7 @@ if (!res.ok) {
 process.stdout.write(text);
 """
     try:
+        progress(f"   Node fetch started for club {club_id}...")
         completed = subprocess.run(
             [node_bin, "--input-type=module", "-e", script, json.dumps(payload)],
             capture_output=True,
@@ -520,17 +698,19 @@ process.stdout.write(text);
             check=False,
         )
     except Exception as e:
-        print(f"Node fetch fallback failed for club {club_id}: {e}")
+        print(f"Node fetch failed for club {club_id}: {e}")
         return []
 
     if completed.returncode != 0:
-        print(f"Node fetch fallback returned an error for club {club_id}: {completed.stderr.strip()}")
+        print(f"Node fetch returned an error for club {club_id}: {completed.stderr.strip()}")
         return []
 
     try:
-        return json.loads(completed.stdout)
+        matches = json.loads(completed.stdout)
+        progress(f"   Node fetch found {len(matches)} matches for club {club_id}.")
+        return matches
     except json.JSONDecodeError as e:
-        print(f"Node fetch fallback returned invalid JSON for club {club_id}: {e}")
+        print(f"Node fetch returned invalid JSON for club {club_id}: {e}")
         return []
 
 
@@ -538,38 +718,14 @@ process.stdout.write(text);
 
 def get_private_matches(club_id):
     """
-    Hits the EA Pro Clubs API to fetch that club's private matches.
+    Fetches that club's recent private match history through Node's fetch.
     Returns a list of match JSON objects (or empty list on error).
     """
-    params = {
-        "matchType": EA_MATCH_TYPE,
-        "platform": EA_PLATFORM,
-        "clubIds": club_id,
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "Referer": (
-            f"https://www.ea.com/games/nhl/{EA_GAME_SLUG}/pro-clubs/match-history?"
-            f"clubId={club_id}&platform={EA_PLATFORM}"
-        )
-    }
-    try:
-        res = requests.get(
-            "https://proclubs.ea.com/api/nhl/clubs/matches",
-            params=params,
-            headers=headers,
-            timeout=15,
-        )
-        if res.status_code != 200:
-            print(f"❌ EA API returned {res.status_code} for club {club_id}")
-            if res.status_code == 403:
-                return fetch_private_matches_with_node(club_id, headers["Referer"])
-            return []
-        return res.json()
-    except Exception as e:
-        print(f"❌ Exception fetching matches for club {club_id}:", e)
-        return fetch_private_matches_with_node(club_id, headers["Referer"])
+    referer = (
+        f"https://www.ea.com/games/nhl/{EA_GAME_SLUG}/pro-clubs/match-history?"
+        f"clubId={club_id}&platform={EA_PLATFORM}"
+    )
+    return fetch_private_matches_with_node(club_id, referer)
 
 # ── DEBUG: DUMP RAW JSON FOR A SPECIFIC MATCH (CALL MANUALLY IF NEEDED) ──
 
@@ -609,12 +765,16 @@ def create_or_fetch_game_log():
         "Match ID", "Date", "Lagout",
         "Team 1", "Team 1 ID", "Team 1 Score", "Team 1 PPG", "Team 1 PPO",
         "Team 2", "Team 2 ID", "Team 2 Score", "Team 2 PPG", "Team 2 PPO",
-        "Team 1 Result", "Team 2 Result", "OT", "Ended Early", "Pushed Timestamp"
+        "Team 1 Result", "Team 2 Result", "OT", "Ended Early", "Pushed Timestamp",
+        "Stitched Match IDs"
     ]
     try:
         ws = sheet.worksheet(log_tab_title("Game Log"))
-        if not ws.get_all_values():
+        values = ws.get_all_values()
+        if not values:
             ws.append_row(headers)
+        elif "Stitched Match IDs" not in values[0]:
+            ws.update("1:1", [values[0] + ["Stitched Match IDs"]])
         return ws
     except gspread.exceptions.WorksheetNotFound:
         ws = sheet.add_worksheet(title=log_tab_title("Game Log"), rows="1000", cols="40")
@@ -629,7 +789,7 @@ def parse_game_row(match, valid_ids):
     Given a match JSON object and valid_ids set, extract a single row for Game Log:
       [Match ID, Date, Lagout, Team1 Name, Team1 ID, Team1 Score, Team1 PPG, Team1 PPO,
        Team2 Name, Team2 ID, Team2 Score, Team2 PPG, Team2 PPO, Team1 Result, Team2 Result,
-       OT, Ended Early, Pushed Timestamp]
+       OT, Ended Early, Pushed Timestamp, Stitched Match IDs]
 
     Returns that row as a list, or None if:
       - clubs data is malformed (not exactly 2 clubs)
@@ -649,6 +809,11 @@ def parse_game_row(match, valid_ids):
     timestamp = match.get("timestamp", 0)
     readable_date = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
     pushed_time = datetime.now().isoformat()
+    component_ids = [str(mid) for mid in match.get("componentMatchIds", []) if str(mid)]
+    stitched_ids = ", ".join(
+        mid for mid in component_ids
+        if normalize_match_id(mid) != normalize_match_id(match_id)
+    )
 
     t1_raw = clubs[team1_id]
     t2_raw = clubs[team2_id]
@@ -749,7 +914,8 @@ def parse_game_row(match, valid_ids):
         team2["result"],
         "yes" if ot_flag else "no",    # OT → only if bit 4 or 8 set AND diff == 1
         "yes" if ended_early else "no",# Ended Early → mercy or DNF
-        pushed_time
+        pushed_time,
+        stitched_ids
     ]
 
 def log_game_data(all_matches, valid_ids):
@@ -762,7 +928,8 @@ def log_game_data(all_matches, valid_ids):
         "Match ID", "Date", "Lagout",
         "Team 1", "Team 1 ID", "Team 1 Score", "Team 1 PPG", "Team 1 PPO",
         "Team 2", "Team 2 ID", "Team 2 Score", "Team 2 PPG", "Team 2 PPO",
-        "Team 1 Result", "Team 2 Result", "OT", "Ended Early", "Pushed Timestamp"
+        "Team 1 Result", "Team 2 Result", "OT", "Ended Early", "Pushed Timestamp",
+        "Stitched Match IDs"
     ]
     worksheet = create_or_fetch_game_log()
     rows_to_append = []
@@ -785,7 +952,7 @@ def get_existing_skater_match_ids():
     try:
         worksheet = sheet.worksheet(log_tab_title("Skater Log"))
         data = worksheet.get_all_values()[1:]
-        return set(r[0] for r in data)
+        return {normalize_match_id(r[0]) for r in data if r}
     except gspread.exceptions.WorksheetNotFound:
         return set()
 
@@ -829,7 +996,8 @@ def log_skater_data(all_matches, valid_ids):
             continue
 
         match_id = str(match.get("matchId"))
-        if match_id in existing_ids:
+        normalized_match_id = normalize_match_id(match_id)
+        if normalized_match_id in existing_ids:
             continue
 
         timestamp = match.get("timestamp", 0)
@@ -925,7 +1093,7 @@ def log_skater_data(all_matches, valid_ids):
                     club_result
                 ]
                 new_rows.append(row)
-                existing_ids.add(match_id)
+                existing_ids.add(normalized_match_id)
 
     if new_rows:
         existing_rows = len(worksheet.get_all_values())
@@ -942,7 +1110,7 @@ def get_existing_goalie_match_ids():
     try:
         worksheet = sheet.worksheet(log_tab_title("Goalie Log"))
         data = worksheet.get_all_values()[1:]
-        return set(r[0] for r in data)
+        return {normalize_match_id(r[0]) for r in data if r}
     except gspread.exceptions.WorksheetNotFound:
         return set()
 
@@ -979,7 +1147,8 @@ def log_goalie_data(all_matches, valid_ids):
             continue
 
         match_id = str(match.get("matchId"))
-        if match_id in existing_ids:
+        normalized_match_id = normalize_match_id(match_id)
+        if normalized_match_id in existing_ids:
             continue
 
         timestamp = match.get("timestamp", 0)
@@ -1049,7 +1218,7 @@ def log_goalie_data(all_matches, valid_ids):
                     club_result
                 ]
                 new_rows.append(row)
-                existing_ids.add(match_id)
+                existing_ids.add(normalized_match_id)
 
     if new_rows:
         existing_rows = len(worksheet.get_all_values())
@@ -1060,11 +1229,14 @@ def log_goalie_data(all_matches, valid_ids):
         for r in new_rows:
             print(f"🥅 Logged goalie: {r[3]} in match {r[0]}")
 
+    return
+
 # ── AGGREGATION OF STATS TO TEAM SHEETS ──
 
+def _unused_old_team_aggregation_block():
 
-        print("⚠️ No Club IDs found in 'Team List'; skipping per-team aggregation.")
-        return
+    print("⚠️ No Club IDs found in 'Team List'; skipping per-team aggregation.")
+    return
 
     # Build mapping of team_name → team_id from Game Log
     try:
@@ -1565,7 +1737,7 @@ def create_or_update_standings():
     # Deduplicate by Match ID
     unique_matches = {}
     for row in rows:
-        mid = row[idx_match_id]
+        mid = normalize_match_id(row[idx_match_id])
         if mid not in unique_matches:
             unique_matches[mid] = row
 
@@ -1575,15 +1747,13 @@ def create_or_update_standings():
         team1 = row[idx_team1]; id1 = row[idx_id1]; res1 = row[idx_result1]
         team2 = row[idx_team2]; id2 = row[idx_id2]; res2 = row[idx_result2]
         ot_flag = (row[idx_ot].strip().lower() == "yes")
-        early_flag = (row[idx_early].strip().lower() == "yes")
-
         if id1 in valid_ids:
             if team1 not in standings:
                 standings[team1] = {"Wins": 0, "Losses": 0, "OTL": 0}
             if res1 == "Win":
                 standings[team1]["Wins"] += 1
             else:
-                if early_flag or ot_flag:
+                if ot_flag:
                     standings[team1]["OTL"] += 1
                 else:
                     standings[team1]["Losses"] += 1
@@ -1594,7 +1764,7 @@ def create_or_update_standings():
             if res2 == "Win":
                 standings[team2]["Wins"] += 1
             else:
-                if early_flag or ot_flag:
+                if ot_flag:
                     standings[team2]["OTL"] += 1
                 else:
                     standings[team2]["Losses"] += 1
@@ -1825,6 +1995,31 @@ def append_tallied_ids(sheet_name, ids_to_append):
 
 
 # ===== OVERRIDE log_game_data TO ENSURE NO DUPLICATES =====
+def update_existing_stitched_match_ids(worksheet, match_id, stitched_ids):
+    if not stitched_ids:
+        return
+
+    values = worksheet.get_all_values()
+    if not values:
+        return
+
+    headers = values[0]
+    try:
+        match_idx = headers.index("Match ID")
+        stitched_idx = headers.index("Stitched Match IDs")
+    except ValueError:
+        return
+
+    target = normalize_match_id(match_id)
+    for row_number, row in enumerate(values[1:], start=2):
+        row_match_id = row[match_idx] if match_idx < len(row) else ""
+        current_value = row[stitched_idx] if stitched_idx < len(row) else ""
+        if normalize_match_id(row_match_id) == target and current_value != stitched_ids:
+            worksheet.update_cell(row_number, stitched_idx + 1, stitched_ids)
+            print(f"Updated stitched IDs for existing match {match_id}: {stitched_ids}")
+            return
+
+
 def log_game_data(all_matches, valid_ids):
     """Append only NEW matches into 'Game Log' by skipping any Match ID already present."""
     worksheet = create_or_fetch_game_log()
@@ -1835,9 +2030,11 @@ def log_game_data(all_matches, valid_ids):
         if row is None:
             continue
         match_id = str(row[0])
-        if match_id in existing_ids:
+        normalized_match_id = normalize_match_id(match_id)
+        if normalized_match_id in existing_ids:
+            update_existing_stitched_match_ids(worksheet, match_id, row[-1] if row else "")
             continue
-        existing_ids.add(match_id)  # Avoid duplicates within same run
+        existing_ids.add(normalized_match_id)  # Avoid duplicates within same run
         rows_to_append.append(row)
     if rows_to_append:
         worksheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
@@ -2149,37 +2346,58 @@ if __name__ == "__main__":
     mode = input("Choose mode (1-5): ").strip()
 
     if mode == "1":
-        print("[1] Fetching + Logging New Matches...")
+        progress("[1] Fetching + Logging New Matches...")
+        progress("Reading Team List from Google Sheet...")
         valid_ids = get_team_list()
+        club_ids = sorted(valid_ids)
+        progress(f"Found {len(club_ids)} clubs to check.")
         all_matches = []
-        for cid in valid_ids:
+        for number, cid in enumerate(club_ids, start=1):
+            progress(f"[{number}/{len(club_ids)}] Fetching club {cid}...")
             matches = get_private_matches(cid)
             all_matches.extend(matches)
+            progress(f"[{number}/{len(club_ids)}] Club {cid} done. Found {len(matches)} matches. Raw total: {len(all_matches)}.")
 
         # Deduplicate by match ID
+        progress(f"Deduplicating {len(all_matches)} raw match records...")
         unique_matches = {}
         for m in all_matches:
             mid = str(m.get("matchId"))
             if mid and mid not in unique_matches:
                 unique_matches[mid] = m
         all_matches_deduped = list(unique_matches.values())
+        progress(f"Deduped to {len(all_matches_deduped)} unique matches.")
+
+        progress("Checking for lagout games to stitch...")
         all_matches_deduped = combine_lagout_matches(all_matches_deduped)
+        progress(f"After lagout stitching: {len(all_matches_deduped)} matches.")
+
+        progress("Filtering to league game days/times...")
         all_matches_deduped = filter_matches_to_league_window(all_matches_deduped)
+        progress(f"After league-window filter: {len(all_matches_deduped)} matches.")
+
+        progress("Splitting regular season vs playoffs...")
         matches_by_phase = split_matches_by_season_phase(all_matches_deduped)
+        progress(
+            f"Regular matches: {len(matches_by_phase['regular'])}; "
+            f"Playoff matches: {len(matches_by_phase['playoffs'])}."
+        )
 
         if not any(matches_by_phase.values()):
-            print("⚠️ No new matches found.")
+            progress("No new matches found.")
         else:
             for phase in ("regular", "playoffs"):
                 phase_matches = matches_by_phase[phase]
                 if not phase_matches:
                     continue
+                progress(f"Writing {len(phase_matches)} {phase} matches to sheet tabs...")
                 set_active_log_phase(phase)
                 log_game_data(phase_matches, valid_ids)
                 log_skater_data(phase_matches, valid_ids)
                 log_goalie_data(phase_matches, valid_ids)
+                progress(f"Finished writing {phase} logs.")
             set_active_log_phase("regular")
-            print("✅ Logs updated.")
+            progress("Logs updated.")
 
     elif mode == "2":
         print("📊 [2] Aggregating Per-Team Tabs...")

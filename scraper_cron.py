@@ -12,6 +12,7 @@ from scraper_working import (
     log_skater_data,
     log_goalie_data,
 )
+from schedule_checker import update_schedule_check
 
 print(f"Running Scraper Automatically (Log Matches) for {EA_GAME_SLUG} on {EA_PLATFORM}")
 valid_ids = get_team_list()
@@ -40,3 +41,8 @@ if any(matches_by_phase.values()):
     print("Logs updated.")
 else:
     print("No new matches found.")
+
+try:
+    update_schedule_check()
+except Exception as exc:
+    print(f"Schedule Check could not be updated: {exc}")
